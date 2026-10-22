@@ -1,0 +1,29 @@
+#include <winver.h>
+1 VERSIONINFO
+FILEVERSION @DSD_FIXED_VERSION@
+PRODUCTVERSION @DSD_FIXED_VERSION@
+FILEFLAGSMASK 0x3fL
+FILEFLAGS 0
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_DLL
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904B0"
+    BEGIN
+      VALUE "CompanyName", "Sonic853\0"
+      VALUE "FileDescription", "TTPlayer DSD audio add-in\0"
+      VALUE "FileVersion", "@DSD_BUILD_VERSION@\0"
+      VALUE "InternalName", "ttp_dsd\0"
+      VALUE "OriginalFilename", "ttp_dsd.dll\0"
+      VALUE "ProductName", "TTPlayer Rebuild DSD\0"
+      VALUE "ProductVersion", "@DSD_BUILD_VERSION@\0"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x0409, 1200
+  END
+END
+
+
