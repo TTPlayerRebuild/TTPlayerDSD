@@ -22,6 +22,6 @@ TTPlayer 原版 AddIn ABI 的独立 x86 DSD 解码插件。面向原版播放器
 
 首次构建按固定版本及 SHA-256 下载依赖。输出在 `build/Release/`。运行包仅含 `AddIn/ttp_dsd.dll` 和 `SHA256SUMS.txt`；完整后端源代码作为独立源码附件提供。许可证保存在仓库和源码附件，不嵌入 DLL。
 
-Action 独立构建，**Release a Version** 使用北京时间日期版本。测试保存在工作区 `rebuild/tests/wav_feedback_20261023/`，不上传、不在 Action 执行、不进发行包。尚未创建或发布远程仓库；在线 CodecAddIn 聚合需要先登记实际仓库及已发布资产。
+Action 独立构建，**Release a Version** 使用北京时间日期版本。测试保存在工作区 `rebuild/tests/wav_feedback_20261023/`，不上传、不在 Action 执行、不进发行包。播放器的 `CodecAddIn-Rebuild` 已登记 [TTPlayerDSD](https://github.com/TTPlayerRebuild/TTPlayerDSD)，发布播放器时下载本仓库最新正式版的 `ttp_dsd-版本.zip`，将 `AddIn/ttp_dsd.dll` 合入合集。2026-10-23 核对时尚无正式 Release，需先发布本插件的运行包；仅有源码或 Git tag 不能用于合集下载。
 
 详见 [实现及验证](docs/IMPLEMENTATION.md)、[依赖](docs/DEPENDENCIES.md)。
