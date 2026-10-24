@@ -9,7 +9,7 @@ include(cmake/legacy_windows.cmake)
 include(cmake/size_release.cmake)
 include(cmake/codec.cmake)
 include(cmake/version.cmake)
-add_library(ttp_dsd SHARED src/plugin.cpp src/reader.cpp src/ttp_dsd.def
+add_library(ttp_dsd SHARED src/plugin.cpp src/reader.cpp src/dsd_metadata.cpp src/ttp_dsd.def
   "${CMAKE_CURRENT_BINARY_DIR}/generated/version.rc")
 add_dependencies(ttp_dsd ttp_dsd_version)
 target_include_directories(ttp_dsd PUBLIC include PRIVATE src)
@@ -17,6 +17,8 @@ target_compile_definitions(ttp_dsd PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_
   _WIN32_WINNT=0x0501 _CRT_SECURE_NO_WARNINGS)
 target_compile_options(ttp_dsd PRIVATE /W4 /permissive- /EHsc /GR- /utf-8 /fp:precise /arch:SSE2)
 target_link_libraries(ttp_dsd PRIVATE codec ole32 uuid shlwapi)
+target_link_options(ttp_dsd PRIVATE /ENTRY:DllMainCRTStartupForYY_Thunks
+  /alternatename:_YY_ThunksOriginalDllMainCRTStartup@12=__DllMainCRTStartup@12)
 set_target_properties(ttp_dsd PROPERTIES PREFIX "" OUTPUT_NAME "ttp_dsd")
 add_custom_command(TARGET ttp_dsd POST_BUILD
   COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/cmake/check_legacy_imports.py"

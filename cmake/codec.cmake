@@ -24,6 +24,8 @@ execute_process(COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/cma
   --build "${TTP_FFMPEG_BUILD}" --vs "${CMAKE_GENERATOR_INSTANCE}"
   --ltl "${ttplayer_vc_ltl_SOURCE_DIR}" --kind dsd ${_ffmpeg_bash}
   COMMAND_ERROR_IS_FATAL ANY)
+file(READ "${TTP_FFMPEG_BUILD}/dsd-source-path.txt" _ffmpeg_source)
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/ffmpeg-source-path.txt" "${_ffmpeg_source}")
 add_library(codec INTERFACE)
 target_include_directories(codec INTERFACE "${_ffmpeg_source}"
   "${TTP_FFMPEG_BUILD}/ffmpeg-dsd")

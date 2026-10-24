@@ -73,6 +73,10 @@ def main():
     if not source.exists():
         tar=b/('ffmpeg-'+FFMPEG_VERSION+'.tar.xz')
         download('https://ffmpeg.org/releases/'+tar.name,tar,FFMPEG_SHA256);extract(tar,b)
+    if a.kind == 'dsd':
+        from patch_dsd_backend import prepare
+        source = prepare(source, b)
+        (b/'dsd-source-path.txt').write_text(str(source),encoding='utf-8')
     make=make_source/'WinRel/gnumake.exe'
     if not make.is_file():
         if not make_source.exists():

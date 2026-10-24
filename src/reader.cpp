@@ -1,3 +1,4 @@
+#include "dsd_metadata.h"
 #include "io.h"
 #include "ttpcomm/audio_format_probe_impl.h"
 #include <atomic>
@@ -5,6 +6,7 @@
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
+#include <libavformat/id3v2.h>
 #include <libavutil/opt.h>
 #include <libswresample/swresample.h>
 }
@@ -18,18 +20,10 @@ bool is_dsd(AVCodecID id) {
          id == AV_CODEC_ID_DSD_LSBF_PLANAR ||
          id == AV_CODEC_ID_DSD_MSBF_PLANAR || id == AV_CODEC_ID_DST;
 }
-struct Tag {
-  std::string key;
-  std::wstring value;
-};
-struct Art {
-  Bytes data;
-  std::wstring mime, description;
-  Picture view{};
-};
 class AudioReader final : public Reader,
                           public Metadata,
                           public Thumbnail,
+                          public MetadataCommit,
                           public ttp::format::SourceInfo {
   LONG refs_{1};
   Input input_;
@@ -46,6 +40,12 @@ class AudioReader final : public Reader,
   std::vector<Tag> tags_;
   std::vector<Art> art_;
   Bytes pcm_;
+  Bytes prefix_;
+  std::vector<double> samples_;
+  std::unique_ptr<DsdMetadata> edit_;
+  HRESULT edit_error_{E_NOTIMPL}, commit_result_{S_OK};
+  bool committed_{};
+  bool resume_decode_{};
   size_t consumed_{};
   uint64_t position_{}, dsf_samples_{}, total_output_{}, decoded_samples_{};
   uint64_t dsdiff_bytes_{}, expected_input_{};
@@ -62,10 +62,27 @@ class AudioReader final : public Reader,
       require(bytes > 0, E_INVALIDARG);
       require(!s.stopped_, HRESULT_FROM_WIN32(ERROR_CANCELLED));
       got = s.input_.read(data, DWORD(bytes));
+      if (!s.input_.seekable && s.prefix_.size() < 80) {
+        const auto n = std::min<size_t>(got, 80 - s.prefix_.size());
+        s.prefix_.insert(s.prefix_.end(), data, data + n);
+        if (s.prefix_.size() == 80 && !memcmp(s.prefix_.data(), "DSD ", 4)) {
+          s.dsf_samples_ = uint64_t(le32(s.prefix_.data() + 64)) |
+                           uint64_t(le32(s.prefix_.data() + 68)) << 32;
+          require(s.dsf_samples_ && s.dsf_samples_ <= INT64_MAX / 1000);
+          require(!(le32(s.prefix_.data() + 56) & 7));
+        }
+      }
       return S_OK;
     });
     if (FAILED(hr)) {
       s.io_error_ = hr;
+      if (hr == E_ABORT || hr == HRESULT_FROM_WIN32(ERROR_CANCELLED)) {
+        s.resume_decode_ = s.input_.seekable;
+        // Without seeking, a failed read that consumed bytes cannot be retried
+        // without losing audio. Keep that failure terminal instead of EOF.
+        if (!s.input_.seekable && s.input_.last_read_count)
+          s.io_error_ = STG_E_READFAULT;
+      }
       return AVERROR(EIO);
     }
     return got ? int(got) : AVERROR_EOF;
@@ -111,8 +128,10 @@ class AudioReader final : public Reader,
     swr_free(&converter_);
     av_channel_layout_uninit(&layout_);
     avcodec_free_context(&decoder_);
-    if (packet_) av_packet_unref(packet_);
-    if (frame_) av_frame_unref(frame_);
+    if (packet_)
+      av_packet_unref(packet_);
+    if (frame_)
+      av_frame_unref(frame_);
     avformat_close_input(&container_);
     if (io_) {
       av_freep(&io_->buffer);
@@ -148,6 +167,7 @@ class AudioReader final : public Reader,
         check_av(avcodec_send_packet(decoder_, nullptr));
       } else {
         check_av(result);
+        require(!(packet_->flags & AV_PKT_FLAG_CORRUPT), STG_E_READFAULT);
         check_av(avcodec_send_packet(decoder_, packet_));
       }
     }
@@ -165,9 +185,8 @@ class AudioReader final : public Reader,
         swr_get_out_samples(converter_, flush ? 0 : frame_->nb_samples);
     check_av(count);
     require(count <= 2097152);
-    std::vector<double> samples(size_t(std::max(count, 1)) *
-                                wave_.Format.nChannels);
-    uint8_t *destination = reinterpret_cast<uint8_t *>(samples.data());
+    samples_.resize(size_t(std::max(count, 1)) * wave_.Format.nChannels);
+    uint8_t *destination = reinterpret_cast<uint8_t *>(samples_.data());
     const int frames = swr_convert(
         converter_, &destination, count,
         flush ? nullptr : const_cast<const uint8_t **>(frame_->extended_data),
@@ -180,17 +199,17 @@ class AudioReader final : public Reader,
     pcm_.resize(kept * wave_.Format.nBlockAlign);
     consumed_ = 0;
     for (size_t i = 0; i < kept * wave_.Format.nChannels; ++i) {
-      const double value = samples[i];
+      const double value = samples_[i];
       require(std::isfinite(value));
-      if (floating_)
-        memcpy(pcm_.data() + i * 8, &value, 8);
-      else {
+      if (!floating_) {
         const int32_t sample = int32_t(std::llround(
             std::clamp(value, -1.0, 8388607.0 / 8388608.0) * 8388608.0));
         for (unsigned b = 0; b < 3; ++b)
           pcm_[i * 3 + b] = BYTE(uint32_t(sample) >> (8 * b));
       }
     }
+    if (floating_ && !pcm_.empty())
+      memcpy(pcm_.data(), samples_.data(), pcm_.size());
     if (!flush)
       av_frame_unref(frame_);
   }
@@ -253,7 +272,8 @@ class AudioReader final : public Reader,
     container_->probesize = 1024 * 1024;
     container_->max_analyze_duration = 2 * AV_TIME_BASE;
     check_av(avformat_open_input(&container_, nullptr, nullptr, nullptr));
-    check_av(avformat_find_stream_info(container_, nullptr));
+    // DSF/DSDIFF headers already carry the audio parameters. Stream-info
+    // probing would decode ahead and try to analyse embedded cover images.
     stream_index_ = -1;
     for (unsigned i = 0; i < container_->nb_streams; ++i) {
       const auto *p = container_->streams[i]->codecpar;
@@ -277,12 +297,18 @@ class AudioReader final : public Reader,
     require(decoded_frame());
     input_rate_ = frame_->sample_rate;
     input_sample_format_ = frame_->format;
-    require(input_rate_ > 0 && input_rate_ <= 2822400 &&
+    require(input_rate_ > 0 && input_rate_ <= 6144000 &&
             frame_->ch_layout.nb_channels > 0 &&
             frame_->ch_layout.nb_channels <= 8);
     require(frame_->ch_layout.order == AV_CHANNEL_ORDER_NATIVE &&
                 frame_->ch_layout.u.mask <= MAXDWORD,
             E_NOTIMPL);
+    const unsigned base = input_rate_ % 44100 == 0 ? 44100 : 48000;
+    const auto multiple = unsigned(input_rate_) / base;
+    require(input_rate_ % base == 0 && multiple >= 8 && multiple <= 128 &&
+                !(multiple & (multiple - 1)),
+            E_NOTIMPL);
+    require(decoder_->codec_id != AV_CODEC_ID_DST || base == 44100, E_NOTIMPL);
     check_av(av_channel_layout_copy(&layout_, &frame_->ch_layout));
     const DWORD rate = dsd_plugin
                            ? DWORD(input_rate_ % 44100 == 0 ? 176400 : 192000)
@@ -314,6 +340,10 @@ class AudioReader final : public Reader,
             ? av_rescale_q(st->duration, st->time_base, {1, 1000})
             : container_->duration / 1000;
     expected_input_ = dsf_samples_ / 8;
+    if (decoder_->codec_id == AV_CODEC_ID_DST &&
+        st->duration != AV_NOPTS_VALUE && st->duration > 0)
+      expected_input_ =
+          uint64_t(av_rescale_q(st->duration, st->time_base, {1, input_rate_}));
     if (dsdiff_bytes_) {
       require(dsdiff_bytes_ % f.nChannels == 0);
       expected_input_ = dsdiff_bytes_ / f.nChannels;
@@ -338,7 +368,7 @@ class AudioReader final : public Reader,
     const auto add = [&](AVDictionary *dictionary) {
       AVDictionaryEntry *t = nullptr;
       while ((t = av_dict_get(dictionary, "", t, AV_DICT_IGNORE_SUFFIX)))
-        tags_.push_back({t->key, wide(t->value)});
+        tags_.push_back({metadata_key(t->key), wide(t->value)});
     };
     add(container_->metadata);
     add(container_->streams[stream_index_]->metadata);
@@ -360,12 +390,27 @@ class AudioReader final : public Reader,
       art_.push_back({Bytes(p.data, p.data + p.size), std::move(mime), {}, {}});
       if (auto *t = av_dict_get(stream->metadata, "title", nullptr, 0))
         art_.back().description = wide(t->value);
+      if (auto *t = av_dict_get(stream->metadata, "comment", nullptr, 0))
+        for (unsigned type = 0; type < 21; ++type)
+          if (!strcmp(t->value, ff_id3v2_picture_types[type]))
+            art_.back().view.type = type;
     }
-    for (auto &p : art_)
-      p.view = {sizeof(Picture),      p.mime.c_str(), p.description.c_str(),
-                DWORD(p.data.size()), p.data.data(),  3};
+    if (edit_) {
+      for (const auto &t : edit_->Tags()) {
+        tags_.erase(
+            std::remove_if(tags_.begin(), tags_.end(),
+                           [&](const Tag &old) { return old.key == t.key; }),
+            tags_.end());
+      }
+      tags_.insert(tags_.begin(), edit_->Tags().begin(), edit_->Tags().end());
+      if (edit_->HasId3())
+        art_ = edit_->OriginalPictures();
+    }
+    refresh_art(art_);
   }
   ~AudioReader() {
+    if (edit_ && edit_->Dirty() && !committed_)
+      Commit();
     close_container();
     av_packet_free(&packet_);
     av_frame_free(&frame_);
@@ -382,6 +427,8 @@ public:
       *out = static_cast<Metadata *>(this);
     else if (same(id, iid_thumbnail))
       *out = static_cast<Thumbnail *>(this);
+    else if (same(id, iid_metadata_commit) && edit_ && edit_->Writable())
+      *out = static_cast<MetadataCommit *>(this);
     else if (same(id, ttp::format::iid_info))
       *out = static_cast<ttp::format::SourceInfo *>(this);
     else
@@ -407,6 +454,18 @@ public:
       require(packet_ && frame_, E_OUTOFMEMORY);
       floating_ = (flags & 2) != 0;
       input_.open(stream);
+      if (input_.seekable && input_.base == 0) {
+        edit_error_ = protect([&]() {
+          auto doc = std::make_unique<DsdMetadata>();
+          doc->Open(stream);
+          edit_ = std::move(doc);
+          return S_OK;
+        });
+        input_.at(input_.base);
+        if (edit_error_ != E_NOTIMPL &&
+            edit_error_ != HRESULT_FROM_WIN32(ERROR_INVALID_DATA))
+          check(edit_error_);
+      }
       if (dsd_plugin && input_.seekable) {
         BYTE header[80]{};
         ULONG n = 0;
@@ -421,6 +480,7 @@ public:
           dsf_samples_ =
               uint64_t(le32(header + 64)) | (uint64_t(le32(header + 68)) << 32);
           require(dsf_samples_ && dsf_samples_ <= INT64_MAX / 1000);
+          require(!(le32(header + 56) & 7));
           const uint64_t declared =
               uint64_t(le32(header + 12)) | (uint64_t(le32(header + 16)) << 32);
           if (input_.size)
@@ -460,7 +520,9 @@ public:
   HRESULT STDMETHODCALLTYPE Capabilities(DWORD *out) override {
     if (!out)
       return E_POINTER;
-    *out = (input_.remote ? 1u : 0u) | (input_.seekable ? 2u : 0u);
+    *out = input_.capabilities(bool(edit_));
+    if (!edit_)
+      *out &= ~(4u | 16u);
     return S_OK;
   }
   HRESULT STDMETHODCALLTYPE Duration(DWORD *out) override {
@@ -509,6 +571,14 @@ public:
   HRESULT STDMETHODCALLTYPE Start() override {
     stopped_ = false;
     ResetEvent(input_.event);
+    if (io_error_ == E_ABORT ||
+        io_error_ == HRESULT_FROM_WIN32(ERROR_CANCELLED)) {
+      io_error_ = S_OK;
+      if (io_) {
+        io_->error = 0;
+        io_->eof_reached = 0;
+      }
+    }
     return S_OK;
   }
   HRESULT STDMETHODCALLTYPE Stop() override {
@@ -523,6 +593,22 @@ public:
       check(buffer->SetLength(0));
       require(opened_, E_UNEXPECTED);
       require(!stopped_, HRESULT_FROM_WIN32(ERROR_CANCELLED));
+      if (resume_decode_) {
+        const auto target = position_;
+        close_container();
+        input_.at(input_.base);
+        position_ = 0;
+        resume_decode_ = false;
+        open_container();
+        while (position_ < target) {
+          require(consumed_ != pcm_.size() || next(), STG_E_READFAULT);
+          const auto n = std::min<uint64_t>(target - position_,
+                                            (pcm_.size() - consumed_) /
+                                                wave_.Format.nBlockAlign);
+          consumed_ += size_t(n) * wave_.Format.nBlockAlign;
+          position_ += n;
+        }
+      }
       DWORD capacity{}, unused{};
       BYTE *out{};
       check(buffer->Capacity(&capacity));
@@ -546,10 +632,56 @@ public:
       require(opened_, E_UNEXPECTED);
       require(input_.seekable, STG_E_INVALIDFUNCTION);
       require(!stopped_, HRESULT_FROM_WIN32(ERROR_CANCELLED));
-      const uint64_t desired =
-          uint64_t(*ms) * wave_.Format.nSamplesPerSec / 1000;
+      uint64_t desired = uint64_t(*ms) * wave_.Format.nSamplesPerSec / 1000;
+      if (total_output_)
+        desired = std::min(desired, total_output_);
+      bool fast = false;
+      // Raw DSF blocks and interleaved DSDIFF have arithmetic byte addresses.
+      // Start on both a container block and resampler phase boundary. The
+      // finite DSD/SWR FIR histories are rebuilt before exposing any samples.
+      if (edit_ && edit_->raw_start && decoder_->codec_id != AV_CODEC_ID_DST &&
+          (desired < position_ ||
+           desired - position_ > uint64_t(wave_.Format.nSamplesPerSec) * 2)) {
+        const auto factor = unsigned(input_rate_) / wave_.Format.nSamplesPerSec;
+        const auto block = edit_->block_samples;
+        const auto target = desired * factor;
+        if (factor && input_rate_ % wave_.Format.nSamplesPerSec == 0 && block &&
+            block % factor == 0 && target > 65536) {
+          const auto anchor = (target - 65536) / block * block;
+          if (anchor && anchor < expected_input_) {
+            avformat_flush(container_);
+            const auto offset =
+                edit_->raw_start + anchor * wave_.Format.nChannels;
+            require(offset <= INT64_MAX &&
+                        avio_seek(io_, int64_t(offset), SEEK_SET) ==
+                            int64_t(offset),
+                    STG_E_SEEKERROR);
+            check(io_error_);
+            const auto *parameters =
+                container_->streams[stream_index_]->codecpar;
+            const auto *codec = avcodec_find_decoder(parameters->codec_id);
+            avcodec_free_context(&decoder_);
+            decoder_ = avcodec_alloc_context3(codec);
+            require(decoder_, E_OUTOFMEMORY);
+            check_av(avcodec_parameters_to_context(decoder_, parameters));
+            decoder_->thread_count = 1;
+            decoder_->err_recognition = AV_EF_CRCCHECK | AV_EF_EXPLODE;
+            check_av(avcodec_open2(decoder_, codec, nullptr));
+            swr_close(converter_);
+            check_av(swr_init(converter_));
+            av_packet_unref(packet_);
+            av_frame_unref(frame_);
+            draining_ = decoder_end_ = eof_ = false;
+            pcm_.clear();
+            consumed_ = 0;
+            decoded_samples_ = anchor;
+            position_ = anchor / factor;
+            fast = true;
+          }
+        }
+      }
       // Backward seeks replay history to preserve decoder overlap/FIR phase.
-      if (desired < position_) {
+      if (!fast && desired < position_) {
         close_container();
         input_.at(input_.base);
         position_ = 0;
@@ -606,13 +738,47 @@ public:
     if (!key || !out)
       return E_POINTER;
     *out = nullptr;
-    for (const auto &t : tags_)
-      if (!_stricmp(key, t.key.c_str()))
-        return text(t.value, out);
-    return E_INVALIDARG;
+    return protect([&]() -> HRESULT {
+      const auto normalized = metadata_key(key);
+      for (const auto &t : tags_)
+        if (normalized == t.key)
+          return text(t.value, out);
+      return E_INVALIDARG;
+    });
   }
-  HRESULT STDMETHODCALLTYPE Set(const char *, const wchar_t *) override {
-    return E_NOTIMPL;
+  HRESULT STDMETHODCALLTYPE Set(const char *key,
+                                const wchar_t *value) override {
+    return protect([&]() {
+      require(!committed_, E_UNEXPECTED);
+      check(edit_error_);
+      require(bool(edit_), E_NOTIMPL);
+      edit_->Set(key, value);
+      if (!key)
+        tags_.clear();
+      else {
+        const auto normalized = metadata_key(key);
+        auto it = std::remove_if(tags_.begin(), tags_.end(), [&](const Tag &t) {
+          return t.key == normalized;
+        });
+        tags_.erase(it, tags_.end());
+        if (value)
+          tags_.push_back({normalized, value});
+      }
+      return S_OK;
+    });
+  }
+  HRESULT STDMETHODCALLTYPE Commit() override {
+    if (committed_)
+      return commit_result_;
+    committed_ = true;
+    close_container();
+    opened_ = false;
+    commit_result_ = protect([&]() {
+      require(bool(edit_), E_NOTIMPL);
+      edit_->Save(art_);
+      return S_OK;
+    });
+    return commit_result_;
   }
   HRESULT STDMETHODCALLTYPE PictureCount(DWORD *out) override {
     if (!out)
@@ -623,13 +789,13 @@ public:
   HRESULT STDMETHODCALLTYPE MaximumBytes(DWORD *out) override {
     if (!out)
       return E_POINTER;
-    *out = 0;
+    *out = edit_ ? 16 * 1024 * 1024 : 0;
     return S_OK;
   }
   HRESULT STDMETHODCALLTYPE MaximumCount(DWORD *out) override {
     if (!out)
       return E_POINTER;
-    *out = 0;
+    *out = edit_ ? 32 : 0;
     return S_OK;
   }
   HRESULT STDMETHODCALLTYPE PictureAt(DWORD n, const Picture **out) override {
@@ -641,14 +807,63 @@ public:
     *out = &art_[n].view;
     return S_OK;
   }
-  HRESULT STDMETHODCALLTYPE ReplacePicture(DWORD, const Picture *,
-                                           DWORD) override {
-    return E_NOTIMPL;
+  HRESULT STDMETHODCALLTYPE ReplacePicture(DWORD n, const Picture *picture,
+                                           DWORD flags) override {
+    return protect([&]() {
+      require(!committed_, E_UNEXPECTED);
+      check(edit_error_);
+      require(edit_->Writable(), STG_E_ACCESSDENIED);
+      require(n < art_.size() && picture && picture->size >= sizeof(Picture) &&
+                  !(flags & ~15u),
+              E_INVALIDARG);
+      auto a = art_[n];
+      if (flags & 1)
+        a.mime = picture->mime ? picture->mime : L"";
+      if (flags & 2)
+        a.description = picture->description ? picture->description : L"";
+      if (flags & 4) {
+        require(picture->type <= 20, E_INVALIDARG);
+        a.view.type = picture->type;
+      }
+      if (flags & 8) {
+        Picture merged{sizeof(Picture), a.mime.c_str(), a.description.c_str(),
+                       picture->bytes,  picture->data,  a.view.type};
+        a = copy_art(&merged);
+      }
+      require(!a.mime.empty() && a.mime.size() <= 128 &&
+                  a.description.size() <= 65536,
+              E_INVALIDARG);
+      art_[n] = std::move(a);
+      refresh_art(art_);
+      edit_->Pictures();
+      return S_OK;
+    });
   }
-  HRESULT STDMETHODCALLTYPE AddPicture(const Picture *) override {
-    return E_NOTIMPL;
+  HRESULT STDMETHODCALLTYPE AddPicture(const Picture *picture) override {
+    return protect([&]() {
+      require(!committed_, E_UNEXPECTED);
+      check(edit_error_);
+      require(edit_->Writable(), STG_E_ACCESSDENIED);
+      require(art_.size() < 32, E_INVALIDARG);
+      auto a = copy_art(picture);
+      art_.push_back(std::move(a));
+      refresh_art(art_);
+      edit_->Pictures();
+      return S_OK;
+    });
   }
-  HRESULT STDMETHODCALLTYPE RemovePicture(DWORD) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE RemovePicture(DWORD n) override {
+    return protect([&]() {
+      require(!committed_, E_UNEXPECTED);
+      check(edit_error_);
+      require(edit_->Writable(), STG_E_ACCESSDENIED);
+      require(n < art_.size(), E_INVALIDARG);
+      art_.erase(art_.begin() + n);
+      refresh_art(art_);
+      edit_->Pictures();
+      return S_OK;
+    });
+  }
 };
 } // namespace
 HRESULT make_reader(void **out) {

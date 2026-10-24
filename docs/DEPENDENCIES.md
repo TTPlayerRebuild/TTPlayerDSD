@@ -9,7 +9,9 @@
 
 DSD profile 只启用 DSD 四种位序/排列和 DST 解码、DSF/IFF 解复用及必要的 avutil、swresample。禁用外部依赖自动探测、程序、网络、视频滤镜、共享库、GPL/nonfree/version3 配置。构建检查 `config.h` 以及 XP/Win7 静态导入表。
 
-仓库自有代码采用 MIT；静态 FFmpeg 后端遵循 LGPL-2.1-or-later，相关完整文本见 `LICENSES/`。生成器不修改 FFmpeg 源码。GNU make 是构建工具，不链接进插件。
+仓库自有代码采用 MIT；静态 FFmpeg 后端遵循 LGPL-2.1-or-later，相关完整文本见 `LICENSES/`。GNU make 是构建工具，不链接进插件。
+
+2026-10-23p1 增加 `cmake/patch_dsd_backend.py`：在 DSD 专用构建目录复制上游源码，修正 `libavcodec/dstdec.c` 的不压缩帧分支，使输入 DSD 字节按后续 dsd2pcm 所用的四字节槽排列；严格拒绝短帧和多余载荷。源文件中有 `TTPlayerDSD` 修改说明，保留全部上游版权。共享下载缓存及其它插件的后端不修改。对应源码包直接包含修正后的完整源码和补丁脚本；脚本识别已应用状态，独立重建时不重复修改。
 
 运行压缩包只含 DLL 和校验文件。发布 Action 同时创建 `-source.zip`，包含插件源码、完整 FFmpeg 源码、make 源码包、固定版本及构建脚本，以便重新构建/替换后端。完整第三方源码仅保存在构建缓存和对应源码附件，不提交到仓库；许可证不嵌入 DLL。
 
